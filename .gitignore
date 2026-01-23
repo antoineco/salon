@@ -1,0 +1,9 @@
+# Cargo
+/target/
+
+# Dev tools
+/result
+/.direnv/
+
+# OS
+.DS_Store
