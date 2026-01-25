@@ -1,13 +1,17 @@
 use chrono::{DateTime, DurationRound, TimeDelta, Utc};
+use serde::{Deserialize, Serialize};
 use std::cmp::max;
 use std::error::Error;
-use std::sync::{Arc, RwLock};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, Write};
+use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
 
 const TIME_STEP: TimeDelta = TimeDelta::minutes(15);
 
 /// A time slot.
 /// Used to represent an appointment, a shift, some employee availability, etc.
-#[derive(Debug, Clone, Copy, Ord, PartialOrd, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Ord, PartialOrd, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TimeRange(DateTime<Utc>, DateTime<Utc>);
 
 impl TimeRange {
@@ -41,20 +45,71 @@ impl TimeRange {
 /// The salon and all its employees.
 #[derive(Debug)]
 pub struct Salon {
-    // The per-employee lock allows booking Alice without blocking reading Bob's schedule.
-    pub employees: Vec<Arc<RwLock<Employee>>>,
+    pub persistence: Arc<PersistenceManager>,
+    // The roster (outer) lock allows adding and removing employees to/from the list.
+    // The per-employee (inner) lock allows booking Alice without blocking reading Bob's schedule.
+    pub employees: RwLock<Vec<Arc<RwLock<Employee>>>>,
 }
 
 impl Salon {
+    /// Initializes a Salon with data recovered from disk.
+    pub fn init<P: AsRef<Path>>(log_path: P) -> Self {
+        let mut employees = Vec::new();
+
+        if let Ok(file) = File::open(&log_path) {
+            let reader = std::io::BufReader::new(file);
+            for l in reader.lines().map_while(Result::ok) {
+                if let Ok(action) = serde_json::from_str::<Action>(&l) {
+                    Self::apply_action_to_state(&mut employees, action)
+                        .expect("failed to apply action to state");
+                }
+            }
+        }
+
+        Self {
+            persistence: Arc::new(PersistenceManager::new(log_path)),
+            employees: RwLock::new(employees),
+        }
+    }
+
+    /// Modifies the state during recovery without triggering new log writes.
+    fn apply_action_to_state(
+        state: &mut Vec<Arc<RwLock<Employee>>>,
+        action: Action,
+    ) -> Result<(), String> {
+        match action {
+            Action::BookAppointment {
+                employee_idx,
+                phone_num,
+                time_range,
+            } => {
+                if let Some(employee_lock) = state.get(employee_idx) {
+                    let mut employee = employee_lock.write().map_err(|e| e.to_string())?;
+                    employee.appointments.push(Appointment {
+                        phone_num,
+                        time_range,
+                    });
+                    employee.appointments.sort_by_key(|appt| appt.time_range);
+                }
+            }
+            Action::AddEmployee { name, shifts } => {
+                state.push(Arc::new(RwLock::new(Employee::new(name, shifts))));
+            }
+        }
+        Ok(())
+    }
+
     /// Returns a flattened list of all time ranges within query_range where at least one employee
     /// is free.
     //
     // TODO: optimize with Boolean Interval Subtraction using the Sweep-Line algorithm instead of
     // iterative range subtractions.
-    pub fn get_available_slots(&self, query_range: TimeRange) -> Vec<TimeRange> {
+    pub fn get_available_slots(&self, query_range: TimeRange) -> Result<Vec<TimeRange>, String> {
         let mut all_free_slots = Vec::new();
 
-        for employee_lock in &self.employees {
+        let employees = self.employees.read().map_err(|e| e.to_string())?;
+
+        for employee_lock in employees.iter() {
             if let Ok(employee) = employee_lock.read() {
                 let mut free_slots = employee.shifts.clone();
                 for appt in &employee.appointments {
@@ -68,7 +123,7 @@ impl Salon {
             }
         }
 
-        merge_overlapping_ranges(all_free_slots)
+        Ok(merge_overlapping_ranges(all_free_slots))
     }
 
     /// Books an appointment with the given employee if range is still available.
@@ -78,14 +133,23 @@ impl Salon {
         time_range: TimeRange,
         phone_num: &str,
     ) -> Result<(), String> {
-        let employee_lock = self
-            .employees
-            .get(employee_idx)
-            .ok_or(format!("employee index {employee_idx} not found"))?;
+        let employee_lock = {
+            let employees = self.employees.read().map_err(|e| e.to_string())?;
+            let employee_lock = employees
+                .get(employee_idx)
+                .ok_or(format!("employee index {employee_idx} not found"))?;
+            employee_lock.clone()
+        };
 
         let mut employee = employee_lock.write().map_err(|e| e.to_string())?;
 
         if employee.can_book(&time_range) {
+            self.persistence.log_action(Action::BookAppointment {
+                employee_idx,
+                phone_num: phone_num.to_string(),
+                time_range,
+            });
+
             employee.appointments.push(Appointment {
                 phone_num: phone_num.to_string(),
                 time_range,
@@ -96,6 +160,23 @@ impl Salon {
         } else {
             Err(format!("slot unavailable {time_range:?}"))?
         }
+    }
+
+    /// Adds an employee to the roster.
+    pub fn add_employee(&self, name: &str, shifts: Vec<TimeRange>) -> Result<(), String> {
+        let mut employees = self.employees.write().map_err(|e| e.to_string())?;
+
+        self.persistence.log_action(Action::AddEmployee {
+            name: name.to_string(),
+            shifts: shifts.clone(),
+        });
+
+        employees.push(Arc::new(RwLock::new(Employee::new(
+            name.to_string(),
+            shifts,
+        ))));
+
+        Ok(())
     }
 }
 
@@ -178,6 +259,51 @@ impl Employee {
                 .iter()
                 // TODO: optimize conflict detection using Binary Search algorithm.
                 .any(|appt| appt.time_range.overlaps(range))
+    }
+}
+
+/// An action that can be written to a WAL and which the state can be restored from.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Action {
+    AddEmployee {
+        name: String,
+        shifts: Vec<TimeRange>,
+    },
+    BookAppointment {
+        employee_idx: usize,
+        phone_num: String,
+        time_range: TimeRange,
+    },
+}
+
+/// Persists writes to a WAL.
+#[derive(Debug)]
+pub struct PersistenceManager {
+    log_file: Mutex<File>,
+}
+
+impl PersistenceManager {
+    /// Constructs a new PersistenceManager from a file at path.
+    pub fn new<P: AsRef<Path>>(path: P) -> Self {
+        let file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .expect("cannot open WAL file");
+
+        Self {
+            log_file: Mutex::new(file),
+        }
+    }
+
+    /// Appends a command to the log as a single line of JSON.
+    pub fn log_action(&self, action: Action) {
+        let mut file = self.log_file.lock().unwrap();
+        let mut encoded = serde_json::to_string(&action).unwrap();
+        encoded.push('\n');
+        file.write_all(encoded.as_bytes())
+            .expect("WAL write failed");
+        file.flush().expect("WAL flush failed");
     }
 }
 
