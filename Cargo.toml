@@ -4,5 +4,7 @@ edition = "2024"
 license = "MIT"
 publish = false
 
-[dependencies]
-chrono = "0.4.43"
+[dependencies.chrono]
+version = "0.4.43"
+default-features = false
+features = ["std"]
