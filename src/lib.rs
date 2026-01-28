@@ -294,7 +294,7 @@ fn merge_overlapping_ranges(mut ranges: Vec<TimeRange>) -> Vec<TimeRange> {
 /// A booked appointment.
 /// Associates a time range with relevant metadata that uniquely identifies the person who performed
 /// the booking.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct Appointment {
     phone_num: String,
     time_range: TimeRange,
@@ -388,6 +388,7 @@ impl PersistenceManager {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+    use tempfile::NamedTempFile;
 
     // Creates a DateTime.
     fn t(hour: u32, min: u32) -> DateTime<Utc> {
@@ -485,5 +486,85 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], range(9, 0, 10, 0));
         assert_eq!(result[1], range(11, 0, 12, 0));
+    }
+
+    #[test]
+    fn init_recover_shifts() {
+        // Disjointed modifications to an employee's shifts (extend, deduct).
+        // Expect: Merged and sorted shifts with empty time ranges in between.
+        let mut wal = NamedTempFile::with_prefix("salontest_").unwrap();
+        let action_log = "\
+            {\"AddEmployee\":{\"name\":\"Alice\"}}\n\
+            {\"AddShift\":{\"employee_idx\":0,\"time_range\":[\"2026-01-01T10:00:00Z\",\"2026-01-01T12:00:00Z\"]}}\n\
+            {\"DelShift\":{\"employee_idx\":0,\"time_range\":[\"2026-01-01T07:00:00Z\",\"2026-01-01T07:30:00Z\"]}}\n\
+            {\"AddShift\":{\"employee_idx\":0,\"time_range\":[\"2026-01-01T08:00:00Z\",\"2026-01-01T10:00:00Z\"]}}\n\
+            {\"DelShift\":{\"employee_idx\":0,\"time_range\":[\"2026-01-01T10:00:00Z\",\"2026-01-01T10:30:00Z\"]}}\n\
+            {\"DelShift\":{\"employee_idx\":0,\"time_range\":[\"2026-01-01T10:15:00Z\",\"2026-01-01T11:00:00Z\"]}}\n\
+            ";
+        wal.write_all(action_log.as_bytes()).unwrap();
+
+        let s = Salon::init(wal);
+
+        let employees = s.employees.read().unwrap();
+        let employee = employees.first().unwrap().read().unwrap();
+
+        assert_eq!(
+            employee.shifts,
+            vec![range(8, 0, 10, 0), range(11, 0, 12, 0)]
+        );
+    }
+
+    #[test]
+    fn init_recover_appointments() {
+        // Populate various appointments, some valid, some not (unknown employee, overlaps).
+        // Expect: Appointments added as-is, but sorted. Validations are the responsibility of the
+        // business logic, not the data recovery logic.
+        let mut wal = NamedTempFile::with_prefix("salontest_").unwrap();
+        let action_log = "\
+            {\"AddEmployee\":{\"name\":\"Alice\"}}\n\
+            {\"AddEmployee\":{\"name\":\"Bob\"}}\n\
+            {\"BookAppointment\":{\"employee_idx\":0,\"phone_num\":\"0001\",\"time_range\":[\"2026-01-01T13:00:00Z\",\"2026-01-01T14:00:00Z\"]}}\n\
+            {\"BookAppointment\":{\"employee_idx\":0,\"phone_num\":\"0002\",\"time_range\":[\"2026-01-01T09:00:00Z\",\"2026-01-01T10:30:00Z\"]}}\n\
+            {\"BookAppointment\":{\"employee_idx\":1,\"phone_num\":\"0003\",\"time_range\":[\"2026-01-01T09:00:00Z\",\"2026-01-01T10:00:00Z\"]}}\n\
+            {\"BookAppointment\":{\"employee_idx\":1,\"phone_num\":\"0004\",\"time_range\":[\"2026-01-01T13:00:00Z\",\"2026-01-01T14:30:00Z\"]}}\n\
+            {\"BookAppointment\":{\"employee_idx\":9,\"phone_num\":\"0001\",\"time_range\":[\"2026-01-01T09:00:00Z\",\"2026-01-01T10:30:00Z\"]}}\n\
+            {\"BookAppointment\":{\"employee_idx\":1,\"phone_num\":\"0001\",\"time_range\":[\"2026-01-01T09:45:00Z\",\"2026-01-01T10:15:00Z\"]}}\n\
+            {\"BookAppointment\":{\"employee_idx\":0,\"phone_num\":\"0001\",\"time_range\":[\"2026-01-01T22:00:00Z\",\"2026-01-01T23:00:00Z\"]}}\n\
+            ";
+        wal.write_all(action_log.as_bytes()).unwrap();
+
+        let s = Salon::init(wal);
+
+        let employees = s.employees.read().unwrap();
+        assert_eq!(employees.len(), 2);
+
+        fn appt(phone_num: &str, time_range: TimeRange) -> Appointment {
+            Appointment {
+                phone_num: phone_num.to_string(),
+                time_range,
+            }
+        }
+
+        let e1 = employees.first().unwrap().read().unwrap();
+        assert_eq!(e1.name, "Alice",);
+        assert_eq!(
+            e1.appointments,
+            vec![
+                appt("0002", range(9, 0, 10, 30)),
+                appt("0001", range(13, 0, 14, 0)),
+                appt("0001", range(22, 0, 23, 0)),
+            ]
+        );
+
+        let e2 = employees.get(1).unwrap().read().unwrap();
+        assert_eq!(e2.name, "Bob",);
+        assert_eq!(
+            e2.appointments,
+            vec![
+                appt("0003", range(9, 0, 10, 0)),
+                appt("0001", range(9, 45, 10, 15)),
+                appt("0004", range(13, 0, 14, 30)),
+            ]
+        );
     }
 }
