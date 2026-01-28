@@ -64,6 +64,10 @@ impl Salon {
                         .expect("failed to apply action to state");
                 }
             }
+            for employee_lock in &employees {
+                let mut employee = employee_lock.write().unwrap();
+                employee.shifts = merge_overlapping_ranges(employee.shifts.clone());
+            }
         }
 
         Self {
@@ -92,8 +96,29 @@ impl Salon {
                     employee.appointments.sort_by_key(|appt| appt.time_range);
                 }
             }
-            Action::AddEmployee { name, shifts } => {
-                state.push(Arc::new(RwLock::new(Employee::new(name, shifts))));
+            Action::AddEmployee { name } => {
+                state.push(Arc::new(RwLock::new(Employee::new(name))));
+            }
+            Action::AddShift {
+                employee_idx,
+                time_range,
+            } => {
+                if let Some(employee_lock) = state.get(employee_idx) {
+                    employee_lock
+                        .write()
+                        .map_err(|e| e.to_string())?
+                        .shifts
+                        .push(time_range);
+                }
+            }
+            Action::DelShift {
+                employee_idx,
+                time_range,
+            } => {
+                if let Some(employee_lock) = state.get(employee_idx) {
+                    let mut employee = employee_lock.write().map_err(|e| e.to_string())?;
+                    employee.shifts = subtract_range(employee.shifts.clone(), time_range);
+                }
             }
         }
         Ok(())
@@ -163,18 +188,63 @@ impl Salon {
     }
 
     /// Adds an employee to the roster.
-    pub fn add_employee(&self, name: &str, shifts: Vec<TimeRange>) -> Result<(), String> {
+    pub fn add_employee(&self, name: &str) -> Result<(), String> {
         let mut employees = self.employees.write().map_err(|e| e.to_string())?;
 
         self.persistence.log_action(Action::AddEmployee {
             name: name.to_string(),
-            shifts: shifts.clone(),
         });
 
-        employees.push(Arc::new(RwLock::new(Employee::new(
-            name.to_string(),
-            shifts,
-        ))));
+        employees.push(Arc::new(RwLock::new(Employee::new(name.to_string()))));
+
+        Ok(())
+    }
+
+    /// Extends an employee's work shifts with the given time range.
+    pub fn add_shift(&self, employee_idx: usize, time_range: TimeRange) -> Result<(), String> {
+        let employee_lock = {
+            let employees = self.employees.read().map_err(|e| e.to_string())?;
+            let employee_lock = employees
+                .get(employee_idx)
+                .ok_or(format!("employee index {employee_idx} not found"))?;
+            employee_lock.clone()
+        };
+
+        let mut employee = employee_lock.write().map_err(|e| e.to_string())?;
+
+        self.persistence.log_action(Action::AddShift {
+            employee_idx,
+            time_range,
+        });
+
+        let mut shifts = employee.shifts.clone();
+        shifts.push(time_range);
+        employee.shifts = merge_overlapping_ranges(shifts);
+
+        Ok(())
+    }
+
+    /// Deducts the given time range from an employee's work shifts.
+    /// Appointments that it may no longer be possible to fulfil as a result of this deletion are
+    /// intentionally not deleted. The responsibility of reconciling such situation is left to the
+    /// caller.
+    pub fn del_shift(&self, employee_idx: usize, time_range: TimeRange) -> Result<(), String> {
+        let employee_lock = {
+            let employees = self.employees.read().map_err(|e| e.to_string())?;
+            let employee_lock = employees
+                .get(employee_idx)
+                .ok_or(format!("employee index {employee_idx} not found"))?;
+            employee_lock.clone()
+        };
+
+        let mut employee = employee_lock.write().map_err(|e| e.to_string())?;
+
+        self.persistence.log_action(Action::DelShift {
+            employee_idx,
+            time_range,
+        });
+
+        employee.shifts = subtract_range(employee.shifts.clone(), time_range);
 
         Ok(())
     }
@@ -240,11 +310,11 @@ pub struct Employee {
 }
 
 impl Employee {
-    /// Constructs an Employee from a name and list of work shifts.
-    pub fn new(name: String, shifts: Vec<TimeRange>) -> Self {
+    /// Constructs an Employee from a name.
+    pub fn new(name: String) -> Self {
         Self {
             name,
-            shifts,
+            shifts: Vec::new(),
             appointments: Vec::new(),
         }
     }
@@ -267,7 +337,14 @@ impl Employee {
 pub enum Action {
     AddEmployee {
         name: String,
-        shifts: Vec<TimeRange>,
+    },
+    AddShift {
+        employee_idx: usize,
+        time_range: TimeRange,
+    },
+    DelShift {
+        employee_idx: usize,
+        time_range: TimeRange,
     },
     BookAppointment {
         employee_idx: usize,
