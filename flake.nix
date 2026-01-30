@@ -64,12 +64,15 @@
             mkShell {
               packages =
                 let
-                  rust-nightly-custom = rust-bin.nightly.latest.default.override {
-                    extensions = [
-                      "rust-analyzer"
-                      "rust-src"
-                    ];
-                  };
+                  rust-nightly-custom = rust-bin.selectLatestNightlyWith (
+                    toolchain:
+                    toolchain.default.override {
+                      extensions = [
+                        "rust-analyzer"
+                        "rust-src"
+                      ];
+                    }
+                  );
                 in
                 [
                   rust-nightly-custom
