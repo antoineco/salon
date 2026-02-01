@@ -127,29 +127,42 @@ impl Salon {
 
     /// Returns a flattened list of all time ranges within query_range where at least one employee
     /// is free.
-    //
-    // TODO: optimize with Boolean Interval Subtraction using the Sweep-Line algorithm instead of
-    // iterative range subtractions.
-    pub fn get_available_slots(&self, query_range: TimeRange) -> Result<Vec<TimeRange>, String> {
+    pub fn get_roster_availability(
+        &self,
+        query_range: TimeRange,
+    ) -> Result<Vec<TimeRange>, String> {
         let mut all_free_slots = Vec::new();
 
         let roster = self.roster.read().map_err(|e| e.to_string())?;
 
         for employee_lock in roster.iter() {
             if let Ok(employee) = employee_lock.read() {
-                let mut free_slots = employee.shifts.clone();
-                for appt in &employee.appointments {
-                    free_slots = subtract_range(free_slots, appt.time_range);
-                }
-                all_free_slots.extend(
-                    free_slots
-                        .into_iter()
-                        .filter(|slot| slot.overlaps(&query_range)),
-                );
+                all_free_slots.extend(employee.available_slots(query_range));
             }
         }
 
         Ok(merge_overlapping_ranges(all_free_slots))
+    }
+
+    /// Returns a list of time ranges within query_range where the given employee is free.
+    pub fn get_employee_availability(
+        &self,
+        employee_idx: usize,
+        query_range: TimeRange,
+    ) -> Result<Vec<TimeRange>, String> {
+        let employee_lock = {
+            let roster = self.roster.read().map_err(|e| e.to_string())?;
+            let employee_lock = roster
+                .get(employee_idx)
+                .ok_or(format!("employee index {employee_idx} not found"))?;
+            employee_lock.clone()
+        };
+
+        Ok(employee_lock
+            .read()
+            .map_err(|e| e.to_string())?
+            .available_slots(query_range)
+            .collect())
     }
 
     /// Books an appointment with the given employee if range is still available.
@@ -318,6 +331,20 @@ impl Employee {
             shifts: Vec::new(),
             appointments: Vec::new(),
         }
+    }
+
+    /// Returns an iterator over the time ranges within query_range where the employee is free.
+    //
+    // TODO: optimize with Boolean Interval Subtraction using the Sweep-Line algorithm instead of
+    // iterative range subtractions.
+    fn available_slots(&self, query_range: TimeRange) -> impl Iterator<Item = TimeRange> {
+        let mut free_slots = self.shifts.clone();
+        for appt in &self.appointments {
+            free_slots = subtract_range(free_slots, appt.time_range);
+        }
+        free_slots
+            .into_iter()
+            .filter(move |slot| slot.overlaps(&query_range))
     }
 
     /// Check if range is still available for booking.
