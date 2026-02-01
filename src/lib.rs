@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::max;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -45,40 +45,41 @@ impl TimeRange {
 /// The salon and all its employees.
 #[derive(Debug)]
 pub struct Salon {
-    pub persistence: Arc<PersistenceManager>,
     // The roster (outer) lock allows adding and removing employees to/from the list.
     // The per-employee (inner) lock allows booking Alice without blocking reading Bob's schedule.
-    pub employees: RwLock<Vec<Arc<RwLock<Employee>>>>,
+    roster: RwLock<Vec<Arc<RwLock<Employee>>>>,
+
+    // Persists all actions to a WAL that allows restoring the salon's state upon initialization.
+    persistence: Arc<PersistenceManager>,
 }
 
 impl Salon {
     /// Initializes a Salon with data recovered from disk.
     pub fn init<P: AsRef<Path>>(log_path: P) -> Self {
-        let mut employees = Vec::new();
+        let mut roster = Vec::new();
 
         if let Ok(file) = File::open(&log_path) {
-            let reader = std::io::BufReader::new(file);
-            for l in reader.lines().map_while(Result::ok) {
-                if let Ok(action) = serde_json::from_str::<Action>(&l) {
-                    Self::apply_action_to_state(&mut employees, action)
+            for l in BufReader::new(file).lines().map_while(Result::ok) {
+                if let Ok(action) = serde_json::from_str(&l) {
+                    Self::apply_action_to_state(&mut roster, action)
                         .expect("failed to apply action to state");
                 }
             }
-            for employee_lock in &employees {
+            for employee_lock in &roster {
                 let mut employee = employee_lock.write().unwrap();
                 employee.shifts = merge_overlapping_ranges(employee.shifts.clone());
             }
         }
 
         Self {
+            roster: RwLock::new(roster),
             persistence: Arc::new(PersistenceManager::new(log_path)),
-            employees: RwLock::new(employees),
         }
     }
 
     /// Modifies the state during recovery without triggering new log writes.
     fn apply_action_to_state(
-        state: &mut Vec<Arc<RwLock<Employee>>>,
+        roster: &mut Vec<Arc<RwLock<Employee>>>,
         action: Action,
     ) -> Result<(), String> {
         match action {
@@ -87,7 +88,7 @@ impl Salon {
                 phone_num,
                 time_range,
             } => {
-                if let Some(employee_lock) = state.get(employee_idx) {
+                if let Some(employee_lock) = roster.get(employee_idx) {
                     let mut employee = employee_lock.write().map_err(|e| e.to_string())?;
                     employee.appointments.push(Appointment {
                         phone_num,
@@ -97,13 +98,13 @@ impl Salon {
                 }
             }
             Action::AddEmployee { name } => {
-                state.push(Arc::new(RwLock::new(Employee::new(name))));
+                roster.push(Arc::new(RwLock::new(Employee::new(name))));
             }
             Action::AddShift {
                 employee_idx,
                 time_range,
             } => {
-                if let Some(employee_lock) = state.get(employee_idx) {
+                if let Some(employee_lock) = roster.get(employee_idx) {
                     employee_lock
                         .write()
                         .map_err(|e| e.to_string())?
@@ -115,7 +116,7 @@ impl Salon {
                 employee_idx,
                 time_range,
             } => {
-                if let Some(employee_lock) = state.get(employee_idx) {
+                if let Some(employee_lock) = roster.get(employee_idx) {
                     let mut employee = employee_lock.write().map_err(|e| e.to_string())?;
                     employee.shifts = subtract_range(employee.shifts.clone(), time_range);
                 }
@@ -132,9 +133,9 @@ impl Salon {
     pub fn get_available_slots(&self, query_range: TimeRange) -> Result<Vec<TimeRange>, String> {
         let mut all_free_slots = Vec::new();
 
-        let employees = self.employees.read().map_err(|e| e.to_string())?;
+        let roster = self.roster.read().map_err(|e| e.to_string())?;
 
-        for employee_lock in employees.iter() {
+        for employee_lock in roster.iter() {
             if let Ok(employee) = employee_lock.read() {
                 let mut free_slots = employee.shifts.clone();
                 for appt in &employee.appointments {
@@ -159,8 +160,8 @@ impl Salon {
         phone_num: &str,
     ) -> Result<(), String> {
         let employee_lock = {
-            let employees = self.employees.read().map_err(|e| e.to_string())?;
-            let employee_lock = employees
+            let roster = self.roster.read().map_err(|e| e.to_string())?;
+            let employee_lock = roster
                 .get(employee_idx)
                 .ok_or(format!("employee index {employee_idx} not found"))?;
             employee_lock.clone()
@@ -189,13 +190,13 @@ impl Salon {
 
     /// Adds an employee to the roster.
     pub fn add_employee(&self, name: &str) -> Result<(), String> {
-        let mut employees = self.employees.write().map_err(|e| e.to_string())?;
+        let mut roster = self.roster.write().map_err(|e| e.to_string())?;
 
         self.persistence.log_action(Action::AddEmployee {
             name: name.to_string(),
         });
 
-        employees.push(Arc::new(RwLock::new(Employee::new(name.to_string()))));
+        roster.push(Arc::new(RwLock::new(Employee::new(name.to_string()))));
 
         Ok(())
     }
@@ -203,8 +204,8 @@ impl Salon {
     /// Extends an employee's work shifts with the given time range.
     pub fn add_shift(&self, employee_idx: usize, time_range: TimeRange) -> Result<(), String> {
         let employee_lock = {
-            let employees = self.employees.read().map_err(|e| e.to_string())?;
-            let employee_lock = employees
+            let roster = self.roster.read().map_err(|e| e.to_string())?;
+            let employee_lock = roster
                 .get(employee_idx)
                 .ok_or(format!("employee index {employee_idx} not found"))?;
             employee_lock.clone()
@@ -230,8 +231,8 @@ impl Salon {
     /// caller.
     pub fn del_shift(&self, employee_idx: usize, time_range: TimeRange) -> Result<(), String> {
         let employee_lock = {
-            let employees = self.employees.read().map_err(|e| e.to_string())?;
-            let employee_lock = employees
+            let roster = self.roster.read().map_err(|e| e.to_string())?;
+            let employee_lock = roster
                 .get(employee_idx)
                 .ok_or(format!("employee index {employee_idx} not found"))?;
             employee_lock.clone()
@@ -505,8 +506,8 @@ mod tests {
 
         let s = Salon::init(wal);
 
-        let employees = s.employees.read().unwrap();
-        let employee = employees.first().unwrap().read().unwrap();
+        let roster = s.roster.read().unwrap();
+        let employee = roster.first().unwrap().read().unwrap();
 
         assert_eq!(
             employee.shifts,
@@ -535,8 +536,8 @@ mod tests {
 
         let s = Salon::init(wal);
 
-        let employees = s.employees.read().unwrap();
-        assert_eq!(employees.len(), 2);
+        let roster = s.roster.read().unwrap();
+        assert_eq!(roster.len(), 2);
 
         fn appt(phone_num: &str, time_range: TimeRange) -> Appointment {
             Appointment {
@@ -545,7 +546,7 @@ mod tests {
             }
         }
 
-        let e1 = employees.first().unwrap().read().unwrap();
+        let e1 = roster.first().unwrap().read().unwrap();
         assert_eq!(e1.name, "Alice",);
         assert_eq!(
             e1.appointments,
@@ -556,7 +557,7 @@ mod tests {
             ]
         );
 
-        let e2 = employees.get(1).unwrap().read().unwrap();
+        let e2 = roster.get(1).unwrap().read().unwrap();
         assert_eq!(e2.name, "Bob",);
         assert_eq!(
             e2.appointments,
