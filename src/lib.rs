@@ -1,3 +1,7 @@
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use chrono::{DateTime, DurationRound, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ordering, max};
@@ -144,7 +148,7 @@ impl Salon {
         Ok(merge_overlapping_ranges(all_free_slots))
     }
 
-    /// Returns a list of time ranges within query_range where the given employee is free.
+    /// Returns a list of time ranges within query_range when the given employee is free.
     pub fn get_employee_availability(
         &self,
         employee_idx: usize,
@@ -507,6 +511,65 @@ impl PersistenceManager {
             .expect("WAL write failed");
         file.flush().expect("WAL flush failed");
     }
+}
+
+// Global state of the web application.
+struct AppState {
+    salon: Salon,
+}
+
+pub fn new_app() -> Router {
+    let shared_state = Arc::new(AppState {
+        salon: Salon::init("salon.log"),
+    });
+
+    Router::new()
+        .route("/availability", get(get_availability))
+        .route("/book", post(book_appointment))
+        .with_state(shared_state)
+}
+
+#[derive(Deserialize)]
+struct AvailabilityQuery {
+    employee: usize,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+}
+
+async fn get_availability(
+    state: State<Arc<AppState>>,
+    query: Query<AvailabilityQuery>,
+) -> Result<Json<Vec<TimeRange>>, (StatusCode, String)> {
+    let query_range = TimeRange::new(query.start, query.end)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    Ok(Json(
+        state
+            .salon
+            .get_employee_availability(query.employee, query_range)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct BookRequest {
+    employee_idx: usize,
+    phone_num: String,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+}
+
+async fn book_appointment(
+    state: State<Arc<AppState>>,
+    payload: Json<BookRequest>,
+) -> Result<(), (StatusCode, String)> {
+    let time_range = TimeRange::new(payload.start, payload.end)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    state
+        .salon
+        .book_appointment(payload.employee_idx, time_range, &payload.phone_num)
+        .map_err(|e| (StatusCode::CONFLICT, e))
 }
 
 #[cfg(test)]
