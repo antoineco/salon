@@ -1,6 +1,6 @@
 use chrono::{DateTime, DurationRound, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
-use std::cmp::max;
+use std::cmp::{Ordering, max};
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -161,8 +161,7 @@ impl Salon {
         Ok(employee_lock
             .read()
             .map_err(|e| e.to_string())?
-            .available_slots(query_range)
-            .collect())
+            .available_slots(query_range))
     }
 
     /// Books an appointment with the given employee if range is still available.
@@ -335,18 +334,65 @@ impl Employee {
         }
     }
 
-    /// Returns an iterator over the time ranges within query_range where the employee is free.
-    //
-    // TODO: optimize with Boolean Interval Subtraction using the Sweep-Line algorithm instead of
-    // iterative range subtractions.
-    fn available_slots(&self, query_range: TimeRange) -> impl Iterator<Item = TimeRange> {
-        let mut free_slots = self.shifts.clone();
-        for appt in &self.appointments {
-            free_slots = subtract_range(free_slots, appt.time_range);
+    /// Returns the time ranges within query_range when the employee is free.
+    fn available_slots(&self, query_range: TimeRange) -> Vec<TimeRange> {
+        use ScheduleEventType::*;
+
+        let mut events = Vec::with_capacity((self.shifts.len() + self.appointments.len()) * 2);
+
+        for shift in &self.shifts {
+            events.push(ScheduleEvent {
+                time: shift.0,
+                typ: ShiftStart,
+            });
+            events.push(ScheduleEvent {
+                time: shift.1,
+                typ: ShiftEnd,
+            });
         }
+        for appt in &self.appointments {
+            events.push(ScheduleEvent {
+                time: appt.time_range.0,
+                typ: AppointmentStart,
+            });
+            events.push(ScheduleEvent {
+                time: appt.time_range.1,
+                typ: AppointmentEnd,
+            });
+        }
+
+        events.sort();
+
+        let mut free_slots = Vec::new();
+        let mut active_shifts = 0;
+        let mut active_appts = 0;
+        let mut last_time: Option<DateTime<Utc>> = None;
+
+        for event in events {
+            let cur_time = event.time;
+
+            if active_shifts > 0
+                && active_appts == 0
+                && let Some(start_time) = last_time
+                && start_time < cur_time
+            {
+                let s = TimeRange(start_time, cur_time);
+                if s.overlaps(&query_range) {
+                    free_slots.push(s);
+                }
+            }
+
+            match event.typ {
+                ShiftStart => active_shifts += 1,
+                ShiftEnd => active_shifts -= 1,
+                AppointmentStart => active_appts += 1,
+                AppointmentEnd => active_appts -= 1,
+            }
+
+            last_time = Some(cur_time);
+        }
+
         free_slots
-            .into_iter()
-            .filter(move |slot| slot.overlaps(&query_range))
     }
 
     /// Check if range is still available for booking and, if so, return the index at which a
@@ -379,6 +425,35 @@ impl Employee {
         }
 
         Some(idx_appt_after)
+    }
+}
+
+/// An event type used in the implementation of a sweep-line algorithm for processing the list of
+/// available slots of an employee.
+#[derive(Ord, PartialOrd, Eq, PartialEq)]
+enum ScheduleEventType {
+    ShiftStart,
+    ShiftEnd,
+    AppointmentStart,
+    AppointmentEnd,
+}
+
+#[derive(Eq, PartialEq)]
+struct ScheduleEvent {
+    time: DateTime<Utc>,
+    typ: ScheduleEventType,
+}
+
+impl Ord for ScheduleEvent {
+    // Sort by time. If equal, prioritize Ends over Starts to avoid zero-length gaps.
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.time.cmp(&other.time).then(self.typ.cmp(&other.typ))
+    }
+}
+
+impl PartialOrd for ScheduleEvent {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -544,6 +619,35 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], range(9, 0, 10, 0));
         assert_eq!(result[1], range(11, 0, 12, 0));
+    }
+
+    #[test]
+    fn available_slots() {
+        let mut empl = Employee::new("Alice".to_string());
+        empl.shifts.push(range(8, 0, 12, 0));
+        empl.appointments.push(appt("0001", range(9, 0, 9, 30)));
+        empl.appointments.push(appt("0002", range(9, 30, 10, 30)));
+        empl.appointments.push(appt("0003", range(11, 30, 12, 0)));
+        empl.shifts.push(range(13, 0, 16, 0));
+        empl.appointments.push(appt("0004", range(14, 0, 15, 0)));
+        empl.appointments.push(appt("0005", range(15, 15, 16, 0)));
+
+        let avail_full_day = empl.available_slots(range(0, 0, 23, 59));
+        assert_eq!(
+            avail_full_day,
+            vec![
+                range(8, 0, 9, 0),
+                range(10, 30, 11, 30),
+                range(13, 0, 14, 0),
+                range(15, 0, 15, 15),
+            ]
+        );
+
+        let avail_select_rng = empl.available_slots(range(11, 0, 13, 30));
+        assert_eq!(
+            avail_select_rng,
+            vec![range(10, 30, 11, 30), range(13, 0, 14, 0),]
+        );
     }
 
     #[test]
