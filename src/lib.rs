@@ -182,18 +182,20 @@ impl Salon {
 
         let mut employee = employee_lock.write().map_err(|e| e.to_string())?;
 
-        if employee.can_book(&time_range) {
+        if let Some(appt_idx) = employee.can_book(&time_range) {
             self.persistence.log_action(Action::BookAppointment {
                 employee_idx,
                 phone_num: phone_num.to_string(),
                 time_range,
             });
 
-            employee.appointments.push(Appointment {
-                phone_num: phone_num.to_string(),
-                time_range,
-            });
-            employee.appointments.sort_by_key(|appt| appt.time_range);
+            employee.appointments.insert(
+                appt_idx,
+                Appointment {
+                    phone_num: phone_num.to_string(),
+                    time_range,
+                },
+            );
 
             Ok(())
         } else {
@@ -347,16 +349,36 @@ impl Employee {
             .filter(move |slot| slot.overlaps(&query_range))
     }
 
-    /// Check if range is still available for booking.
-    fn can_book(&self, range: &TimeRange) -> bool {
-        self.shifts
+    /// Check if range is still available for booking and, if so, return the index at which a
+    /// corresponding appointment could be inserted.
+    fn can_book(&self, range: &TimeRange) -> Option<usize> {
+        if !self
+            .shifts
             .iter()
             .any(|shift| range.0 >= shift.0 && range.1 <= shift.1)
-            && !self
-                .appointments
-                .iter()
-                // TODO: optimize conflict detection using Binary Search algorithm.
-                .any(|appt| appt.time_range.overlaps(range))
+        {
+            return None;
+        }
+
+        let Err(idx_appt_after) = self
+            .appointments
+            .binary_search_by(|appt| appt.time_range.0.cmp(&range.0))
+        else {
+            return None;
+        };
+        if let Some(appt_after) = self.appointments.get(idx_appt_after)
+            && appt_after.time_range.overlaps(range)
+        {
+            return None;
+        }
+        if idx_appt_after > 0
+            && let Some(appt_before) = self.appointments.get(idx_appt_after - 1)
+            && appt_before.time_range.overlaps(range)
+        {
+            return None;
+        }
+
+        Some(idx_appt_after)
     }
 }
 
@@ -426,6 +448,14 @@ mod tests {
     // Creates a TimeRange.
     fn range(h1: u32, m1: u32, h2: u32, m2: u32) -> TimeRange {
         TimeRange::new(t(h1, m1), t(h2, m2)).unwrap()
+    }
+
+    // Creates an Appointment.
+    fn appt(phone_num: &str, time_range: TimeRange) -> Appointment {
+        Appointment {
+            phone_num: phone_num.to_string(),
+            time_range,
+        }
     }
 
     #[test]
@@ -517,6 +547,110 @@ mod tests {
     }
 
     #[test]
+    fn cannot_book_outside_shift() {
+        // Shift:   08:00 - 10:30
+        // Booking: 10:15 - 10:45
+        // Expect: NOK
+        let mut empl = Employee::new("Alice".to_string());
+        empl.shifts.push(range(8, 0, 10, 30));
+
+        let result = empl.can_book(&range(10, 15, 11, 45));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn cannot_book_no_shift() {
+        // No shift.
+        // Booking: 10:00 - 10:30
+        // Expect: NOK
+        let empl = Employee::new("Alice".to_string());
+
+        let result = empl.can_book(&range(10, 0, 10, 30));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn can_book_free_shift() {
+        // Shift:   08:00 - 12:00
+        // Booking: 10:00 - 10:30
+        // Expect: OK
+        let mut empl = Employee::new("Alice".to_string());
+        empl.shifts.push(range(8, 0, 12, 0));
+
+        let result = empl.can_book(&range(10, 0, 10, 30));
+        assert_eq!(result, Some(0));
+    }
+
+    #[test]
+    fn can_book_around_appointments() {
+        // Appointments booked: 9:00 - 10:00,  10:30 - 11:00
+        let mut empl = Employee::new("Alice".to_string());
+        empl.shifts.push(range(8, 0, 12, 0));
+        empl.appointments.push(appt("0000", range(9, 0, 10, 0)));
+        empl.appointments.push(appt("0001", range(10, 30, 11, 0)));
+
+        // Booking: 8:00 - 8:30 (before all)
+        // Expect: OK
+        assert_eq!(
+            empl.can_book(&range(8, 0, 8, 30)),
+            Some(0),
+            "expected booking possible before"
+        );
+        // Booking: 11:30 - 12:00 (after all)
+        // Expect: OK
+        assert_eq!(
+            empl.can_book(&range(11, 30, 12, 0)),
+            Some(2),
+            "expected booking possible after"
+        );
+        // Booking: 10:00 - 10:30 (in between)
+        // Expect: OK
+        assert_eq!(
+            empl.can_book(&range(10, 0, 10, 30)),
+            Some(1),
+            "expected booking possible in between"
+        );
+    }
+
+    #[test]
+    fn cannot_book_overlapping_appointments() {
+        // Appointments booked: 9:00 - 10:00,  10:30 - 11:00
+        let mut empl = Employee::new("Alice".to_string());
+        empl.shifts.push(range(8, 0, 12, 0));
+        empl.appointments.push(appt("0000", range(9, 0, 10, 0)));
+        empl.appointments.push(appt("0001", range(10, 30, 11, 0)));
+
+        // Booking: 8:45 - 9:15 (overlap at start)
+        // Expect: NOK
+        assert_eq!(
+            empl.can_book(&range(8, 45, 9, 15)),
+            None,
+            "expected overlap with start of next"
+        );
+        // Booking: 9:45 - 10:15 (overlap at end)
+        // Expect: NOK
+        assert_eq!(
+            empl.can_book(&range(9, 45, 10, 15)),
+            None,
+            "expected overlap with end of previous"
+        );
+        // Booking: 9:00 - 9:30 (overlap within)
+        // Expect: NOK
+        assert_eq!(
+            empl.can_book(&range(9, 0, 9, 30)),
+            None,
+            "expected overlap within"
+        );
+        // Booking: 8:45 - 11:15 (overlap multiple)
+        // Expect: NOK
+        assert_eq!(
+            empl.can_book(&range(8, 45, 11, 15)),
+            None,
+            "expected overlap with multiple"
+        );
+    }
+
+    #[test]
     fn init_recover_shifts() {
         // Disjointed modifications to an employee's shifts (extend, deduct).
         // Expect: Merged and sorted shifts with empty time ranges in between.
@@ -565,13 +699,6 @@ mod tests {
 
         let roster = s.roster.read().unwrap();
         assert_eq!(roster.len(), 2);
-
-        fn appt(phone_num: &str, time_range: TimeRange) -> Appointment {
-            Appointment {
-                phone_num: phone_num.to_string(),
-                time_range,
-            }
-        }
 
         let e1 = roster.first().unwrap().read().unwrap();
         assert_eq!(e1.name, "Alice",);
